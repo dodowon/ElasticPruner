@@ -1,0 +1,1415 @@
+# Copyright 2026 dodowon
+# SPDX-License-Identifier: MIT
+
+### Find the function set to replace layers with a genetic algorithm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import random
+import time
+from datetime import datetime
+from copy import deepcopy
+from types import SimpleNamespace
+import math
+from elasticpruner.utils.genetic_math import top_k_sim_logits, topk_cosine_sim_logits, top_k_rwem
+from elasticpruner.utils.genetic_utils import apply_architecture_constraints, gradual_mutation
+#random.seed(time.time())
+
+def change_target_mask_size(l0_module, config):
+    print("change mask")
+    for mask in l0_module.masks.keys():
+        if mask == "head":
+            l0_module.masks[mask].target_mask_size = config.n_heads
+        elif mask == "intermediate":
+            l0_module.masks[mask].target_mask_size = config.intermediate_size
+        elif mask == "layer":
+            l0_module.masks[mask].target_mask_size = config.n_layers
+        elif mask == "hidden":
+            l0_module.masks[mask].target_mask_size = config.d_model
+
+def kl_from_logits(logits_p: torch.Tensor, logits_q: torch.Tensor):
+    """
+    KL(P || Q) where P, Q are distributions from logits
+    logits_p, logits_q: shape (..., vocab_size)
+    """
+    # Convert to a probability distribution
+    logits_q = logits_q.to(logits_p.device)
+    p = F.softmax(logits_p, dim=-1)
+    q = F.softmax(logits_q, dim=-1)
+
+    # Using log_softmax allows stable computation
+    log_p = F.log_softmax(logits_p, dim=-1)
+    log_q = F.log_softmax(logits_q, dim=-1)
+
+    # KL(P||Q) = sum( p * (log_p - log_q) )
+    kl = torch.sum(p * (log_p - log_q), dim=-1)  # over the last dimension
+    kl_mean = kl.mean()
+    similarity = torch.exp(-kl_mean)
+    return similarity.item()
+
+
+
+def formatted_current_time():
+    now = datetime.now()
+    return now.strftime("%Y-%m-%d_%H-%M-%S")  # e.g., 2025-01-23 15:30:45
+
+def add_median_to_tensor(x):
+    median_value = torch.median(x)
+
+    # Add the median value to every element of the tensor
+    result_tensor = x + median_value
+
+    return result_tensor
+
+def subtract_median_to_tensor(x):
+    median_value = torch.median(x)
+
+    # Add the median value to every element of the tensor
+    result_tensor = x - median_value
+
+    return result_tensor
+
+def add_gaussian_noise(x, mean=0.0, std=0.1):
+    noise = torch.randn_like(x) * std + mean
+    return x + noise
+
+def add_uniform_noise(x, low=-0.1, high=0.1):
+    noise = (high - low) * torch.rand_like(x) + low
+    return x + noise
+
+def standardize_tensor(x):
+    return (x - torch.mean(x)) / torch.std(x)
+
+def add_point_5(x):
+    return x + 0.5
+
+def sub_point_5(x):
+    return x - 0.5
+
+def mul_2(x):
+    return x * 2
+
+def mul_3(x):
+    return x * 3
+
+def add_1(x):
+    return x + 1.0
+
+def solve_d_model(total_params, n_layers, n_heads, intermediate_size, vocab_size, head_dim=128):
+    """
+    compute_params (n_heads decoupled from d_model, head_dim fixed):
+        attn      = 4 * d * head_dim * n_heads
+        ffn       = 3 * d * inter
+        ln        = 2 * d
+        total     = n_layers*(attn + ffn + ln) + 2*vocab*d + d
+                  = d * (4*n_layers*head_dim*n_heads
+                         + 3*n_layers*inter
+                         + 2*n_layers
+                         + 2*vocab
+                         + 1)
+    => d is the solution of a linear equation (the earlier 4*d^2 term disappears).
+    """
+    coef = (4 * n_layers * head_dim * n_heads
+            + 3 * n_layers * intermediate_size
+            + 2 * n_layers
+            + 2 * vocab_size
+            + 1)
+    if coef <= 0:
+        raise ValueError("The coefficient is 0 or less.")
+    return total_params // coef
+
+
+def solve_n_layers(total_params, d_model, n_heads, intermediate_size, vocab_size, head_dim=128):
+    """
+    total = n_layers * per_layer + 2*vocab*d + d
+    per_layer = 4*d*head_dim*n_heads + 3*d*inter + 2*d
+    => n_layers = (total - 2*vocab*d - d) / per_layer
+    """
+    per_layer = (4 * d_model * head_dim * n_heads
+                 + 3 * d_model * intermediate_size
+                 + 2 * d_model)
+    embedding_part = 2 * vocab_size * d_model + d_model
+    if per_layer <= 0:
+        raise ValueError("per_layer is 0 or less.")
+    return (total_params - embedding_part) // per_layer
+
+
+def solve_intermediate_size(total_params, d_model, n_heads, n_layers, vocab_size, head_dim=128):
+    """
+    total = n_layers*(4*d*head_dim*n_heads + 3*d*inter + 2*d) + 2*vocab*d + d
+    => inter = (total - 2*vocab*d - d - n_layers*(4*d*head_dim*n_heads + 2*d))
+              / (3*n_layers*d)
+    """
+    embedding_part = 2 * vocab_size * d_model + d_model
+    non_ffn_per_layer = 4 * d_model * head_dim * n_heads + 2 * d_model
+    numerator = total_params - embedding_part - n_layers * non_ffn_per_layer
+    denom = n_layers * 3 * d_model
+    if denom <= 0:
+        raise ValueError("The intermediate_size denominator is 0 or less.")
+    return numerator // denom
+
+
+def solve_n_heads(total_params, d_model, n_layers, intermediate_size, vocab_size, head_dim=128):
+    """
+    total = n_layers*(4*d*head_dim*n_heads + 3*d*inter + 2*d) + 2*vocab*d + d
+    => n_heads = (total - 2*vocab*d - d - n_layers*(3*d*inter + 2*d))
+                / (4 * head_dim * n_layers * d)
+    """
+    embedding_part = 2 * vocab_size * d_model + d_model
+    non_attn_per_layer = 3 * d_model * intermediate_size + 2 * d_model
+    numerator = total_params - embedding_part - n_layers * non_attn_per_layer
+    denom = 4 * n_layers * head_dim * d_model
+    if denom <= 0:
+        raise ValueError("The n_heads denominator is 0 or less.")
+    return numerator // denom
+
+# (Optional) to align to a multiple of the number of heads:
+def solve_d_model_multiple_of_heads(total_params, n_layers, intermediate_size, vocab_size, n_heads):
+    d_cont = solve_d_model(total_params, n_layers, intermediate_size, vocab_size)
+    # Snap to the nearest multiple of n_heads
+    d_rounded = max(n_heads, int(round(d_cont / n_heads)) * n_heads)
+    return d_rounded
+
+def pick_n_heads_by_cap(d_model: int, max_heads: int) -> int:
+    """
+    Returns the largest divisor of d_model that does not exceed max_heads.
+    Always guarantees at least 1 (1 is a divisor of every integer).
+    """
+    if d_model <= 0 or max_heads < 1:
+        raise ValueError("d_model must be positive and max_heads must be at least 1.")
+    
+    best = 1  # 1 is always a divisor, so it is the minimum safe value
+    # Divisor search: O(sqrt(d_model))
+    i = 1
+    while i * i <= d_model:
+        if d_model % i == 0:
+            a, b = i, d_model // i
+            if a <= max_heads and a > best:
+                best = a
+            if b <= max_heads and b > best:
+                best = b
+        i += 1
+    return best
+
+
+
+class AirGeneticSparsityHead:
+    MODULE_LIST = ['d_model', 'intermediate_size', 'n_layers','n_heads']
+    HEAD_DIM = 128
+    def __init__(self, model,teacher_model,target_params=int(1.3e9),sim_func="kl",iter_num=20):
+        self.model = model
+        self.teacher = teacher_model
+        self.criterion = nn.CrossEntropyLoss()
+        self.population = []
+        self.target_params = target_params
+        self.target_output = None
+        self.init_taget_module_cfg = None
+        self.origin_module_cfg = None
+        self.range_ratio = 0.03
+        sim_func_name = sim_func['func_name']
+        topk_rate = sim_func.get("topk_rate")
+        if sim_func_name == "cosine":
+            self.sim_func = self.calculate_cosine_similarity
+        elif sim_func_name == "kl" :
+            self.sim_func = kl_from_logits
+        elif sim_func_name == "topk_exact":
+            self.sim_func = lambda x, y: top_k_sim_logits(x, y, k=topk_rate)
+        elif sim_func_name == "topk_cos":
+            self.sim_func = lambda x, y: topk_cosine_sim_logits(x, y, k=topk_rate)
+        elif sim_func_name == "rwem":
+            self.sim_func = lambda x, y: top_k_rwem(x, y, k=topk_rate)
+        else:
+            raise Exception(f"{sim_func} is not support")
+
+        self.apply_fn = self.apply_config
+        self.iter_num = iter_num
+        self.score_cache = {}
+        self.elite_ratio = 0.1
+        self.finish_generation = 0
+
+    def infer_missing_llama_config(self,
+        target_params: int,
+        d_model: int = None,
+        n_heads: int = None,
+        n_layers: int = None,
+        intermediate_size: int = None,
+        vocab_size: int = 32000,
+        total_params=0
+    ):
+        """
+        LLaMA-style config computation: given 3 of the 4 (d_model, n_heads, n_layers, intermediate_size),
+        back-computes the remaining 1 and adjusts so that the total parameter count matches
+        target_params. n_heads can also be mutated/inferred independently of d_model.
+        """
+        # First define the parameter count function (head_dim fixed, n_heads independent)
+        def compute_params(d_model, n_heads, n_layers, intermediate_size, vocab_size):
+            attn = 4 * d_model * self.HEAD_DIM * n_heads
+            ffn = 2 * d_model * intermediate_size + intermediate_size * d_model
+            ln = 2 * d_model
+            per_layer = attn + ffn + ln
+            total = n_layers * per_layer
+            embedding = vocab_size * d_model
+            return total + embedding * 2 + d_model
+        total = target_params
+        # Check that exactly one of the 4 is None
+        given = [d_model, n_heads, n_layers, intermediate_size]
+        if given.count(None) != 1:
+            print(f"[WARNING] Exactly one of d_model, n_heads, n_layers, intermediate_size must be None: {given}")
+            return None
+
+        # Integer alignment / upper bound (n_heads is no longer fixed to d_model // 128)
+        if isinstance(d_model, int):
+            if d_model > 4096: d_model = 4096
+            d_model = d_model // 128 * 128
+            if d_model <= 0:
+                return None
+        if isinstance(n_heads, int):
+            if n_heads > 32: n_heads = 32
+            if n_heads < 1: n_heads = 1
+        if isinstance(n_layers, int):
+            n_layers += n_layers % 2
+            if n_layers > 32: n_layers = 32
+        if isinstance(intermediate_size, int):
+            intermediate_size += intermediate_size % 2
+            if intermediate_size > 11008: intermediate_size = 11008
+
+        # Estimate the missing item
+        if d_model is None:
+                dm = solve_d_model(total, n_layers=n_layers, n_heads=n_heads,
+                                       intermediate_size=intermediate_size,
+                                       vocab_size=vocab_size, head_dim=self.HEAD_DIM)
+                # Snap to a multiple of 128 (choose whichever of lower / upper is closer to target)
+                lower = int(dm // 128) * 128
+                upper = lower + 128
+                p_lower = compute_params(lower, n_heads, n_layers, intermediate_size, vocab_size) if lower > 0 else None
+                p_upper = compute_params(upper, n_heads, n_layers, intermediate_size, vocab_size)
+                if p_lower is None or abs(p_upper - total_params) < abs(p_lower - total_params):
+                    dm = upper
+                    new_total = p_upper
+                else:
+                    dm = lower
+                    new_total = p_lower
+                indiv = dict(
+                            d_model=dm,
+                            n_heads=n_heads,
+                            n_layers=n_layers,
+                            intermediate_size=intermediate_size,
+                            total_params=new_total,
+                            vocab_size=vocab_size
+                        )
+                if abs(new_total - target_params) < target_params * self.range_ratio and dm > 0 and self.check_indiv_constraint(indiv):
+                    return indiv
+
+        elif n_heads is None:
+                nh = solve_n_heads(total, d_model=d_model, n_layers=n_layers,
+                                       intermediate_size=intermediate_size,
+                                       vocab_size=vocab_size, head_dim=self.HEAD_DIM)
+                # Clamp to the range 1 ~ 32
+                if nh > 32: nh = 32
+                if nh < 1:
+                    return None
+                new_total = compute_params(d_model, nh, n_layers, intermediate_size, vocab_size)
+                indiv = dict(
+                        d_model=d_model,
+                        n_heads=nh,
+                        n_layers=n_layers,
+                        intermediate_size=intermediate_size,
+                        total_params=new_total,
+                        vocab_size=vocab_size
+                    )
+                if abs(new_total - target_params) < target_params * self.range_ratio and nh > 0 and self.check_indiv_constraint(indiv):
+                    return indiv
+
+        elif n_layers is None:
+                nl = solve_n_layers(total, d_model=d_model, n_heads=n_heads,
+                                        intermediate_size=intermediate_size,
+                                        vocab_size=vocab_size, head_dim=self.HEAD_DIM)
+                nl += nl % 2
+                new_total = compute_params(d_model, n_heads, nl, intermediate_size, vocab_size)
+                indiv = dict(
+                        d_model=d_model,
+                        n_heads=n_heads,
+                        n_layers=nl,
+                        intermediate_size=intermediate_size,
+                        total_params=new_total,
+                        vocab_size=vocab_size
+                    )
+                if abs(new_total - target_params) < target_params * self.range_ratio and nl > 0 and self.check_indiv_constraint(indiv):
+                    return indiv
+
+        elif intermediate_size is None:
+                i = solve_intermediate_size(total, d_model=d_model, n_heads=n_heads,
+                                                n_layers=n_layers, vocab_size=vocab_size,
+                                                head_dim=self.HEAD_DIM)
+                i = i // 64 * 64
+                new_total = compute_params(d_model, n_heads, n_layers, i, vocab_size)
+                indiv = dict(
+                        d_model=d_model,
+                        n_heads=n_heads,
+                        n_layers=n_layers,
+                        intermediate_size=i,
+                        total_params=new_total,
+                        vocab_size=vocab_size
+                    )
+                if abs(new_total - target_params) < target_params * self.range_ratio and i > 0 and self.check_indiv_constraint(indiv):
+                    return indiv
+
+        return None
+
+    def randomize_bits(self,bit_length=8):
+        """
+        num:        integer to convert
+        bit_length: bit length (number of bits to keep)
+        """
+        # Randomly generate 0/1 for the bit length
+
+        bits = [str(random.randint(0, 1)) for _ in range(bit_length)]
+        if bits[0] == '0' and bits[1] == '0':
+            bits[1] = '1'
+        # list → string → integer conversion
+        bit_str = ''.join(bits)
+        new_num = int(bit_str, 2)
+        return new_num, bit_str
+
+    def check_indiv_constraint(self,indiv):
+        for key in self.MODULE_LIST:
+            if indiv[key] > self.origin_module_cfg[key]:
+                return False
+        return True
+
+    def calculate_cosine_similarity(self,tensor1, tensor2, dim=2):
+        """
+        Calculates the cosine similarity between two tensors along the specified dimension.
+    
+        Args:
+            tensor1 (torch.Tensor): The first tensor.
+            tensor2 (torch.Tensor): The second tensor.
+            dim (int): The dimension along which to compute cosine similarity.
+        
+        Returns:
+            torch.Tensor: Cosine similarity values.
+        """
+        tensor1 = tensor1.to(tensor2.device)
+        return F.cosine_similarity(tensor1, tensor2, dim=dim).mean().item()
+
+    def intialize_population(self,population_size, target_modules=[], mutant=False):
+        """
+        target_modules : List[Dict]
+            * a dict that includes initial values, such as {"head" : 16}
+        """
+        if target_modules and self.init_taget_module_cfg is None:
+            self.init_taget_module_cfg = target_modules
+        if mutant:
+            self.population = self.population[:-population_size]
+            target_modules = self.init_taget_module_cfg
+        else:
+            self.population = []
+        for _ in range(population_size):
+            now_target_modules = deepcopy(target_modules)
+            remove_key = random.choice(self.MODULE_LIST)
+            now_target_modules.pop(remove_key)
+            candidate = {}
+            for key in now_target_modules.keys():
+                bit_int = format(target_modules[key], 'b')
+                _, new_bit = self.randomize_bits(len(bit_int))
+                candidate[key] = new_bit
+            for key in self.MODULE_LIST:
+                if key not in now_target_modules.keys():
+                    candidate[key] = None
+            self.population.append(candidate)
+        # for _ in range(population_size):
+        #     candidate = [self.FUNCTION_LIST[random.randint(0, len(self.FUNCTION_LIST)-1)] for _ in range(function_length)]
+        #     population.append(candidate)
+        # if not special_functions:
+        #     for i in range(len(special_functions)):
+        #         population[i] = special_functions[i]
+        # return population
+
+    def get_random_population(self,population_size):
+        """
+        target_modules : List[Dict]
+            * a dict that includes initial values, such as {"head" : 16}
+        """
+        population = []
+        
+        for _ in range(population_size):
+            now_target_modules = deepcopy(self.init_taget_module_cfg)
+            remove_key = random.choice(list(now_target_modules.keys()))
+            now_target_modules.pop(remove_key)
+            candidate = {}
+            for key in now_target_modules.keys():
+                bit_int = format(self.init_taget_module_cfg[key], 'b')
+                _, new_bit = self.randomize_bits(len(bit_int))
+                candidate[key] = new_bit
+            for key in self.MODULE_LIST:
+                if key not in now_target_modules.keys():
+                    candidate[key] = None
+            population.append(candidate)
+
+        return population
+
+    def evolution(self, x, population_size):
+        import matplotlib.pyplot as plt
+        iter_index = []
+        score_index = []
+        history = {"d_model": [], "intermediate_size": [], "n_layers": [], "n_heads": []}
+        best_indiv = None
+        best_score = -30000
+        iter_num = self.iter_num
+        patience = 0
+        before_best = 0
+        top_logits = None
+        elite_score_list = []
+        for i in range(1, iter_num):
+            self.score_cache = {}
+            score_list = []
+            new_population = []
+            for indiv in self.population:
+                sim, new_indiv, logits = self.apply_fn(indiv, x)
+                print(sim)
+                #sim = self.calculate_cosine_similarity(applied_x, y).mean().item()
+                score_list.append(sim)
+                new_population.append(new_indiv)
+                flat_indiv = self.flat_chromo(new_indiv)
+                self.score_cache[flat_indiv] = sim
+                if sim > best_score:
+                    best_score = sim
+                    best_indiv = new_indiv
+                    top_logits = logits
+            # FSDP: broadcast the score from rank 0 so that all ranks perform the same selection
+            # (prevents the score from differing per rank due to tiny differences in the FSDP forward)
+            if torch.distributed.is_initialized():
+                score_tensor = torch.tensor(score_list, dtype=torch.float64, device="cuda")
+                torch.distributed.broadcast(score_tensor, src=0)
+                score_list = score_tensor.tolist()
+                # best_score/best_indiv are also synchronized to rank 0
+                best_idx = score_list.index(max(score_list))
+                if max(score_list) > best_score:
+                    best_score = max(score_list)
+                    best_indiv = new_population[best_idx]
+
+            if best_score == before_best:
+                patience += 1
+            if patience >= 5:
+                print("GA early stopped")
+                break
+            before_best = best_score
+            temp_history = {"d_model": [], "intermediate_size": [], "n_layers": [], "n_heads": []}
+            for popul in new_population:
+                if popul == {}:
+                    continue
+                for key in temp_history.keys():
+                    temp_history[key].append(int(popul[key],2))
+            for key in temp_history.keys():
+                history[key].append(sum(temp_history[key]) / len(temp_history[key]))
+            #print(f"best individual {best_indiv}")
+            print(f"best score {best_score}")
+
+            population = [fun for _, fun in sorted(zip(score_list, new_population), key=lambda pair: pair[0], reverse=True)]
+            score_list.sort(reverse=True)
+            k = max(2, int(self.elite_ratio * population_size))
+            parent_candidate = population[:k]
+            print("##09 parent candidate: ", parent_candidate)
+            elite_score_list.append(sum(score_list[:k])/k)
+            elite_cnt = max(2, int(self.elite_ratio * population_size))
+            elites = deepcopy(population[:elite_cnt])
+            for elite in elites:
+                if elite.get("total_params"):
+                    elite.pop("total_params")
+                none_key = random.choice(self.MODULE_LIST)
+                elite[none_key] = None
+            offspring = self.make_new_gen(parent_candidate, population_size - elite_cnt)
+            immigrant_cnt = max(1, int(0.03 * population_size))
+            new_population = self.get_random_population(immigrant_cnt)
+            self.population = elites + offspring[:-immigrant_cnt] + new_population
+            # mutate_parent = random.choice(parent_candidate)
+            # mutated_indiv = self.mutate_gen(mutate_parent)
+            ## added mutation
+            # self.intialize_population(10, mutant=True)
+
+            # population[-1] = mutated_indiv
+     
+
+            iter_index.append(i)
+            score_index.append(best_score)
+        int_config_set = {k:int(v, 2) if isinstance(v, str) else v for k,v in best_indiv.items()}
+        # int_config_set.pop("total_params")
+        # print(f"after {iter_num} iterations, the best individual is {int_config_set}")
+        # last_config = infer_missing_llama_config(self.target_params, **int_config_set)
+        self.finish_generation = i
+        print(f"after {iter_num} iterations, score:{best_score}, the best individual is {int_config_set}")
+        iters = list(range(len(history["d_model"])))
+        
+        ## compute the elite mean
+        output_dict = {
+            "best_indiv": best_indiv,
+            "logits" : top_logits
+        }
+        return output_dict
+
+
+    def apply_config(self, config_set, x, just_input=False):
+        #config_set['n_heads'] = 16
+        int_config_set = {k:int(v, 2) if isinstance(v, str) else v for k,v in config_set.items()}
+        if just_input:
+            last_config = config_set
+        else:
+            last_config = self.infer_missing_llama_config(self.target_params, **int_config_set)
+        if last_config is None:
+            return -320000.0, {}, None
+        last_config = SimpleNamespace(**last_config)
+        bit_config = {k: format(v, 'b') for k, v in vars(last_config).items()}
+        flat_config = self.flat_chromo(bit_config)
+        if flat_config in self.score_cache:
+            return self.score_cache[flat_config], bit_config, None
+
+        l0_module = self.model.model.l0_module
+        target_module_cfg = l0_module.set_model_info(last_config, 3)
+        origin_target_model_cfg = deepcopy(l0_module.target_model_info)
+        l0_module.target_model_info = target_module_cfg
+
+        # Change the mask sparsity of each module
+        origin_target_mask_sizes = {}
+        origin_eval_target_model = {}
+        for mask_name in l0_module.masks:
+            origin_target_mask_sizes[mask_name] = l0_module.masks[mask_name].target_mask_size
+            origin_eval_target_model[mask_name] = l0_module.masks[mask_name].eval_target_model
+            l0_module.masks[mask_name].eval_target_model = True
+        change_target_mask_size(l0_module, last_config)
+
+        # Call model forward in eval mode → l0_module.deterministic_z() uses the changed target_mask_size
+        model_param = next(self.model.parameters())
+        def change_device(tensor_dict, device="cuda", dtype=None):
+            return {k: v.to(device=device, dtype=dtype) if isinstance(v, torch.Tensor) and v.is_floating_point() 
+                    else v.to(device=device) if isinstance(v, torch.Tensor) else v for k, v in tensor_dict.items()}
+        x = change_device(x, model_param.device, model_param.dtype)
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=model_param.dtype):
+            output = self.model(x)
+
+        # target_output is pre-computed in the callback and set on self.target_output
+
+        # Restore the original state
+        l0_module.target_model_info = origin_target_model_cfg
+        for mask_name in l0_module.masks:
+            l0_module.masks[mask_name].target_mask_size = origin_target_mask_sizes[mask_name]
+            l0_module.masks[mask_name].eval_target_model = origin_eval_target_model[mask_name]
+
+        bit_config = {k: format(v, 'b') for k, v in vars(last_config).items()}
+        score = self.sim_func(output['logits'], self.target_output['logits'])
+        logits = [output['logits'].detach().cpu(), self.target_output['logits']]
+        return score, bit_config, logits
+
+    def make_new_gen(self, parents_, population_size):
+        population = []
+        while len(population) < population_size:
+            indiv = {}
+            parents = []
+            parents.append(random.choice(parents_))
+            parents.append(random.choice(parents_))
+                    
+            for key in self.MODULE_LIST:
+                if random.random() < 0.5:
+                    gene = parents[0][key]
+                else:
+                    gene = parents[1][key]
+                prob = random.random()
+                if prob < 0.5:
+                    gene = self.mutate_hamming_k(gene)
+                else:
+                    gene = self.mutate_bitflip(gene, 0.05)
+                indiv[key] = gene
+                # indiv[key] = self.shuffle_genetic(parents[0][key], parents[1][key])
+            none_key = random.choice(self.MODULE_LIST)
+            indiv[none_key] = None
+            population.append(indiv)
+        return population
+
+    def make_new_gen_old(self, parents_, population_size):
+        population = []
+        while len(population) < population_size:
+            indiv = {}
+            parents = []
+            parents.append(random.choice(parents_))
+            parents.append(random.choice(parents_))
+            for key in self.MODULE_LIST:
+                # if random.random() < 0.5:
+                #     gene = parents[0][key]
+                # else:
+                #     gene = parents[1][key]
+                gene = self.shuffle_genetic(parents[0][key], parents[1][key])
+                prob = random.random()
+                if prob < 0.5:
+                    gene = self.mutate_hamming_k(gene)
+                else:
+                    gene = self.mutate_bitflip(gene, 0.05)
+                indiv[key] = gene
+                # indiv[key] = self.shuffle_genetic(parents[0][key], parents[1][key])
+            none_key = random.choice(self.MODULE_LIST)
+            indiv[none_key] = None
+            population.append(indiv)
+        return population
+
+    def mutate_hamming_k(self, bitstr: str, k: int = 1) -> str:
+        L = len(bitstr)
+        if L == 0:
+            return bitstr
+        if L >= 5:
+            k = 2
+        k = max(1, min(L, k))
+        idxs = random.sample(range(L), k)
+        bits = list(bitstr)
+        for i in idxs:
+            bits[i] = '0' if bits[i] == '1' else '1'
+        s = ''.join(bits)
+        if int(s, 2) == 0:
+            s = s[:-1] + '1'
+        return s
+
+    def tournament_select(self, pop, scores, k=5):
+        idxs = random.sample(range(len(pop)), k)
+        best = max(idxs, key=lambda i: scores[i])
+        return pop[best]
+
+    # def make_new_gen(self, parents_, population_size):
+    #     population = []
+    #     while len(population) < population_size:
+    #         indiv = {}
+    #         parents = []
+    #         parents.append(random.choice(parents_))
+    #         parents.append(random.choice(parents_))
+    #         none_module = {}
+    #         parent1_none_key = [k for k, v in parents[0].items() if v is None]
+    #         parent2_none_key = [k for k, v in parents[1].items() if v is None]
+    #         # print(parent1_none_key)
+    #         if parent1_none_key[0] == parent2_none_key[0]:
+    #             none_module['same'] = parent1_none_key[0]
+    #         else:
+    #             none_module[0] = parent1_none_key[0]
+    #             none_module[1] = parent2_none_key[0]
+    #         chose_none = random.random()
+    #         chose_none = round(chose_none)
+    #         if none_module.get("same") is None:
+    #             indiv[none_module[chose_none]] = None
+    #             indiv[none_module[1-chose_none]] = parents[chose_none][none_module[1-chose_none]]
+
+    #         else:
+    #             indiv[none_module['same']] = None
+
+    #         for key in self.MODULE_LIST:
+    #             if key not in indiv.keys():
+    #                 new_gene = self.shuffle_genetic(parents[0][key], parents[1][key])
+    #                 indiv[key] = new_gene
+
+    #         population.append(indiv)
+    #     return population
+
+    def mutate_bitflip(self, bitstr: str, p_mut: float = 0.01, avoid_all_zero: bool = True) -> str:
+        bits = list(bitstr)
+        for i in range(len(bits)):
+            if random.random() < p_mut:
+                bits[i] = '1' if bits[i] == '0' else '0'
+        s = ''.join(bits)
+        if avoid_all_zero and int(s, 2) == 0:  # turn on the last bit to avoid 0
+            s = s[:-1] + '1'
+        return s
+
+    def shuffle_genetic(self, gene1, gene2):
+        # print("##9955: ", gene1, gene2)
+        min_len = min([len(gene1), len(gene2)])
+        # random.seed(time.time())
+                # If both parents are identical, introduce slight mutation to avoid clones
+
+        rand_idx = random.randrange(1, min_len)
+        # rand_idx = random.randint(0, len(gene1)-1)
+        part_gene1 = gene1[:rand_idx]
+        part_gene2 = gene2[rand_idx:]
+        new_gene = part_gene1 + part_gene2
+
+        p_mut = 0.01
+        bits = list(new_gene)
+        for i in range(len(bits)):
+            if random.random() < p_mut:
+                bits[i] = '1' if bits[i] == '0' else '0'
+        new_gene = ''.join(bits)
+        # random.shuffle(new_gene)
+        # new_gene = "".join(new_gene)
+        int_new_gene = int(new_gene, 2)
+        if int_new_gene == 0:
+            new_gene = new_gene[:-1] + '1'
+        # print("new gene ", new_gene)
+        return new_gene
+
+    def flat_chromo(self, indiv):
+        result = ""
+        if indiv == {}:
+            return ""
+        for key in self.MODULE_LIST:
+            result += str(indiv[key])
+
+        return result
+
+class AirGeneticSparsityConstraintHead(AirGeneticSparsityHead):
+    DROP_MODULE_LIST = ['d_model', 'intermediate_size', 'n_heads']
+    def __init__(self, model,teacher_model,target_params=int(1.3e9),sim_func="cosine",iter_num=20, is_logit=True, is_bound_space=False):
+        super().__init__(model,teacher_model,target_params,sim_func,iter_num)
+        self.is_logit = is_logit
+        if self.is_logit:
+            self.apply_fn = self.apply_config
+        else:
+            self.apply_fn = self.apply_config_eval_loss
+        self.elite_ratio = 0.1
+        self.score_cache = {}
+        self.is_bound_space=is_bound_space
+        self.gradual_size = {}
+
+    def evolution(self, x, population_size):
+        import matplotlib.pyplot as plt
+        iter_index = []
+        score_index = []
+        history = {"d_model": [], "intermediate_size": [], "n_layers": [], "n_heads": []}
+        best_indiv = None
+        best_score = -30000
+        iter_num = self.iter_num
+        patience = 0
+        before_best = 0
+        top_logits = None
+        elite_score_list = []
+        for i in range(1, iter_num):
+            self.score_cache = {}
+            self.invalidate_arch_cache()
+            score_list = []
+            new_population = []
+            local_best_score = -30000
+            local_best_logits = None
+            for indiv in self.population:
+                sim, new_indiv, logits = self.apply_fn(indiv, x)
+                #sim = self.calculate_cosine_similarity(applied_x, y).mean().item()
+                score_list.append(sim)
+                new_population.append(new_indiv)
+                flat_indiv = self.flat_chromo(new_indiv)
+                self.score_cache[flat_indiv] = sim
+                # top_logits is for return/logging (non-collective), so track it using local values only.
+                # best_score/best_indiv must not be updated with the local sim before the broadcast.
+                # (A best_score raised with the local sim is not reverted by the 'raise-only' correction below, so
+                #  best_score differs per rank, the early-stop (patience/break) timing diverges, and
+                #  the evolution forward (collective) count differs per rank, causing an NCCL deadlock)
+                if sim > local_best_score:
+                    local_best_score = sim
+                    local_best_logits = logits
+            # FSDP: broadcast the score from rank 0 so that all ranks perform the same selection
+            # (prevents the score from differing per rank due to tiny differences in the FSDP forward)
+            if torch.distributed.is_initialized():
+                score_tensor = torch.tensor(score_list, dtype=torch.float64, device="cuda")
+                torch.distributed.broadcast(score_tensor, src=0)
+                score_list = score_tensor.tolist()
+
+            # Decide best_score/best_indiv/patience/early-stop only from the 'synchronized score_list'.
+            # Same path for distributed and non-distributed → accumulated only from the max broadcast from the initial value -30000,
+            # so best_score, before_best, patience and break match exactly on all ranks.
+            gen_best_idx = score_list.index(max(score_list))
+            if score_list[gen_best_idx] > best_score:
+                best_score = score_list[gen_best_idx]
+                best_indiv = new_population[gen_best_idx]
+                top_logits = local_best_logits
+
+            if best_score == before_best:
+                patience += 1
+            if patience >= 5:
+                print("GA early stopped")
+                break
+            before_best = best_score
+            temp_history = {"d_model": [], "intermediate_size": [], "n_layers": [], "n_heads": []}
+            for popul in new_population:
+                if popul == {}:
+                    continue
+                for key in temp_history.keys():
+                    temp_history[key].append(int(popul[key],2))
+            for key in temp_history.keys():
+                history[key].append(sum(temp_history[key]) / len(temp_history[key]))
+            #print(f"best individual {best_indiv}")
+            print(f"best score {best_score}")
+
+            population = [fun for _, fun in sorted(zip(score_list, new_population), key=lambda pair: pair[0], reverse=True)]
+            score_list.sort(reverse=True)
+            k = max(2, int(self.elite_ratio * population_size))
+            parent_candidate = population[:k]
+            print("##09 parent candidate: ", parent_candidate)
+            elite_score_list.append(sum(score_list[:k])/k)
+            elite_cnt = max(2, int(self.elite_ratio * population_size))
+            elites = deepcopy(population[:elite_cnt])
+            for elite in elites:
+                if elite.get("total_params"):
+                    elite.pop("total_params")
+                none_key = random.choice(self.MODULE_LIST)
+                elite[none_key] = None
+            offspring = self.make_new_gen(parent_candidate, population_size - elite_cnt)
+            immigrant_cnt = max(1, int(0.03 * population_size))
+            new_population = self.get_random_population(immigrant_cnt)
+            self.population = elites + offspring[:-immigrant_cnt] + new_population
+            # mutate_parent = random.choice(parent_candidate)
+            # mutated_indiv = self.mutate_gen(mutate_parent)
+            ## added mutation
+            # self.intialize_population(10, mutant=True)
+
+            # population[-1] = mutated_indiv
+     
+
+            iter_index.append(i)
+            score_index.append(best_score)
+        int_config_set = {k:int(v, 2) if isinstance(v, str) else v for k,v in best_indiv.items()}
+        # int_config_set.pop("total_params")
+        # print(f"after {iter_num} iterations, the best individual is {int_config_set}")
+        # last_config = infer_missing_llama_config(self.target_params, **int_config_set)
+        self.finish_generation = i
+        print(f"after {iter_num} iterations, score:{best_score}, the best individual is {int_config_set}")
+        
+        iters = list(range(len(history["d_model"])))
+        
+        ## compute the elite mean
+        output_dict = {
+            "best_indiv": best_indiv,
+            "logits" : top_logits
+        }
+        return output_dict
+
+    def apply_config_eval_loss(self, config_set, x, just_input=False):
+        #config_set['n_heads'] = 16
+        int_config_set = {k:int(v, 2) if isinstance(v, str) else v for k,v in config_set.items()}
+        print(int_config_set)
+        if just_input:
+            last_config = config_set
+        else:
+            last_config = self.infer_missing_llama_config(self.target_params, **int_config_set)
+        if last_config is None:
+            return -320000.0, {}, None
+        print(last_config)
+        last_config = SimpleNamespace(**last_config)
+        bit_config = {k: format(v, 'b') for k, v in vars(last_config).items()}
+        flat_config = self.flat_chromo(bit_config)
+        if flat_config in self.score_cache:
+            return self.score_cache[flat_config], bit_config, None
+
+        l0_module = self.model.model.l0_module
+        target_module_cfg = l0_module.set_model_info(last_config, 3)
+        origin_target_model_cfg = deepcopy(l0_module.target_model_info)
+        l0_module.target_model_info = target_module_cfg
+
+        # Change the mask sparsity of each module
+        origin_target_mask_sizes = {}
+        origin_eval_target_model = {}
+        for mask_name in l0_module.masks:
+            origin_target_mask_sizes[mask_name] = l0_module.masks[mask_name].target_mask_size
+            origin_eval_target_model[mask_name] = l0_module.masks[mask_name].eval_target_model
+            l0_module.masks[mask_name].eval_target_model = True
+        change_target_mask_size(l0_module, last_config)
+
+        # Call model forward in eval mode → l0_module.deterministic_z() uses the changed target_mask_size
+        model_param = next(self.model.parameters())
+
+        def change_device(tensor_dict, device="cuda", dtype=None):
+            return {k: v.to(device=device, dtype=dtype) if isinstance(v, torch.Tensor) and v.is_floating_point() 
+                    else v.to(device=device) if isinstance(v, torch.Tensor) else v for k, v in tensor_dict.items()}
+
+        x = change_device(x, model_param.device, model_param.dtype)
+
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=model_param.dtype):
+            output = self.model(x)
+            loss = self.model.loss(output, x)
+        print("end model forward")
+
+        # target_output is pre-computed in the callback and set on self.target_output
+
+        # Restore the original state
+        l0_module.target_model_info = origin_target_model_cfg
+        for mask_name in l0_module.masks:
+            l0_module.masks[mask_name].target_mask_size = origin_target_mask_sizes[mask_name]
+            l0_module.masks[mask_name].eval_target_model = origin_eval_target_model[mask_name]
+
+        bit_config = {k: format(v, 'b') for k, v in vars(last_config).items()}
+        # print("ce loss shape ", loss['ce_loss'].shape)
+        score = math.exp(-loss['ce_loss'])
+        logits = None
+        return score, bit_config, logits
+    
+    def make_new_gen(self, parents_, population_size):
+        population = []
+        if self.is_bound_space:
+            ## The code to update self.gradual_size has not been added yet; to be added later
+            population = gradual_mutation(elites=parents_, population_size=population_size, gradual_size=self.gradual_size, apply_constraints=True)
+            for indiv in population:
+                key = 'n_layers'
+                indiv[key] = self.constraint_mutate(indiv[key], key) 
+                none_key = random.choice(self.DROP_MODULE_LIST)
+                indiv[none_key] = None
+
+            return population
+        while len(population) < population_size:
+            indiv = {}
+            parents = []
+            parents.append(random.choice(parents_))
+            parents.append(random.choice(parents_))
+                    
+            for key in self.MODULE_LIST:
+                if random.random() < 0.5:
+                    gene = parents[0][key]
+                else:
+                    gene = parents[1][key]
+                prob = random.random()
+                if key == 'n_layers':
+                    gene = self.constraint_mutate(gene, key)
+                elif prob < 0.5:
+                    gene = self.mutate_hamming_k(gene)
+                else:
+                    gene = self.mutate_bitflip(gene, 0.05)
+                #gene = self.constraint_mutate(gene, key)
+                indiv[key] = gene
+                # indiv[key] = self.shuffle_genetic(parents[0][key], parents[1][key])
+            none_key = random.choice(self.DROP_MODULE_LIST)
+            indiv[none_key] = None
+            population.append(indiv)
+        return population
+
+    MASK_TO_MODULE = {
+        'hidden': 'd_model',
+        'intermediate': 'intermediate_size',
+        'layer': 'n_layers',
+        'head': 'n_heads',
+    }
+    MODULE_TO_MASK = {v: k for k, v in MASK_TO_MODULE.items()}
+
+    def _get_current_arch_from_masks(self):
+        """Compute the current discrete architecture values from the mask sparsity"""
+        l0_module = self.model.model.l0_module
+        _, expected_sparsitys = l0_module.calculate_expected_score_sparsity()
+
+        current_arch = {}
+        for mask_name, module_name in self.MASK_TO_MODULE.items():
+            if mask_name not in l0_module.masks:
+                print("passed key: ",mask_name)
+                continue
+            mask = l0_module.masks[mask_name]
+            sp = expected_sparsitys[mask_name]
+            if hasattr(sp, 'dim') and sp.dim() > 0:
+                sparsity = sp.mean().item()
+            elif hasattr(sp, 'item'):
+                sparsity = sp.item()
+            else:
+                sparsity = float(sp)
+            current_arch[module_name] = round(mask.mask_size * (1 - sparsity))
+        return current_arch
+
+    def constraint_mutate(self, gene, module_name, mutation_range=0.1):
+        """
+        A replacement for mutate_hamming_k / mutate_bitflip.
+        Mutates only within the range of the current architecture value based on mask sparsity ± (mutation_range of the original module).
+
+        Args:
+            gene: binary string (e.g. '10110')
+            module_name: one of MODULE_LIST ('d_model', 'intermediate_size', 'n_layers')
+            mutation_range: allowed mutation ratio relative to the original module (default 0.1 = 10%)
+        Returns:
+            The mutated binary string
+        """
+        if gene is None:
+            return None
+
+        if not hasattr(self, '_cached_current_arch'):
+            self._cached_current_arch = self._get_current_arch_from_masks()
+
+        source_val = self.origin_module_cfg[module_name]
+        delta = max(1, round(source_val * mutation_range))
+        center = self._cached_current_arch.get(module_name, int(gene, 2))
+
+        low = max(1, center - delta)
+        high = min(source_val, center + delta)
+        print(f"{module_name} mutate center, delta, low, high : {center}, {delta}, {low}, {high}")
+
+        mutated_val = random.randint(low, high)
+
+        result = format(mutated_val, 'b')
+        return result
+
+    def invalidate_arch_cache(self):
+        """Call at the start of a generation to refresh the mask sparsity cache"""
+        if hasattr(self, '_cached_current_arch'):
+            del self._cached_current_arch
+
+    #def flat_chromo(self, indiv):
+    #    result = ""
+    #    print(indiv.keys())
+    #    for key in self.MODULE_LIST:
+    #        result += str(indiv[key])
+    #
+    #    return result
+
+
+class AirGeneticSparsityConstraintLayerWise(AirGeneticSparsityConstraintHead):
+    """
+    Layer-wise genetic algorithm.
+
+    - Going down from self.max_layer in steps of layer_step, creates up to num_layer_groups
+      "layer units" (layer groups).
+    - Distributes the whole population evenly over all layer units (population_size // num_layer_groups).
+    - Within each layer unit, the individual's n_layers is fixed to that group's value,
+      and n_layers is kept as is during crossover/mutation too.
+    - d_model / intermediate_size use the existing mutation/crossover algorithms as they are,
+      but one of the two is left as None and corrected with infer_missing_llama_config.
+    """
+
+    # Layers are fixed, so the only keys that can be left empty as None are d_model and intermediate_size.
+    DROP_MODULE_LIST = ['d_model', 'intermediate_size']
+
+    def __init__(
+        self,
+        model,
+        teacher_model,
+        target_params=int(1.3e9),
+        sim_func="cosine",
+        iter_num=20,
+        is_logit=True,
+        num_layer_groups: int = 10,
+        layer_step: int = 2,
+        max_layer: int = None,
+    ):
+        super().__init__(model, teacher_model, target_params, sim_func, iter_num, is_logit)
+        self.num_layer_groups = num_layer_groups
+        self.layer_step = layer_step
+        self.max_layer = max_layer
+        self.layer_groups = None  # filled in when set_max_layer() is called
+
+    # ------------------------------------------------------------------
+    # layer group management
+    # ------------------------------------------------------------------
+    def set_max_layer(self, max_layer: int = None):
+        """
+        Sets self.max_layer and creates the layer_groups list.
+
+        - If the max_layer argument is given, use that value,
+        - If self.max_layer is already set, use it as is,
+        - If neither exists, use self.origin_module_cfg['n_layers'] as the default.
+
+        layer_groups is created as [max_layer, max_layer - step, ..., up to num_layer_groups entries].
+        No more are added once a value becomes <=0.
+        """
+        if max_layer is not None:
+            self.max_layer = max_layer
+        elif self.max_layer is None:
+            if self.origin_module_cfg and 'n_layers' in self.origin_module_cfg:
+                self.max_layer = int(self.origin_module_cfg['n_layers'])
+            else:
+                raise ValueError(
+                    "Either set max_layer or provide origin_module_cfg['n_layers']."
+                )
+
+        # infer_missing_llama_config forces n_layers to be even, so align here as well
+        if self.max_layer % 2 != 0:
+            self.max_layer -= 1
+
+        self.layer_groups = []
+        for i in range(self.num_layer_groups):
+            nl = self.max_layer - i * self.layer_step
+            if nl <= 0:
+                break
+            self.layer_groups.append(nl)
+
+        print(
+            f"[LayerWise] max_layer={self.max_layer}, "
+            f"num_layer_groups={self.num_layer_groups}, "
+            f"layer_step={self.layer_step}, "
+            f"layer_groups={self.layer_groups}"
+        )
+        return self.layer_groups
+
+    # ------------------------------------------------------------------
+    # Individual creation utilities
+    # ------------------------------------------------------------------
+    def _ensure_layer_groups(self):
+        if self.layer_groups is None:
+            self.set_max_layer()
+
+    def _make_indiv_with_fixed_layer(self, target_modules, layer_count):
+        """Create a random individual with n_layers fixed to layer_count."""
+        candidate = {}
+        candidate['n_layers'] = format(int(layer_count), 'b')
+
+        remove_key = random.choice(self.DROP_MODULE_LIST)
+        for key in self.DROP_MODULE_LIST:
+            if key == remove_key:
+                candidate[key] = None
+            else:
+                bit_int = format(target_modules[key], 'b')
+                _, new_bit = self.randomize_bits(len(bit_int))
+                candidate[key] = new_bit
+        return candidate
+
+    def _indiv_layer_count(self, indiv):
+        """Extract the integer n_layers value from an individual."""
+        nl = indiv.get('n_layers')
+        if nl is None:
+            return None
+        if isinstance(nl, str):
+            return int(nl, 2)
+        return int(nl)
+
+    def _assign_layer_group(self, layer_count):
+        """Snap the given layer value to the nearest layer_group."""
+        self._ensure_layer_groups()
+        return min(self.layer_groups, key=lambda x: abs(x - layer_count))
+
+    # ------------------------------------------------------------------
+    # Population initialization / random migration
+    # ------------------------------------------------------------------
+    def intialize_population(self, population_size, target_modules=[], mutant=False):
+        """
+        Creates population_size / num_layer_groups individuals for each layer unit.
+        The n_layers of each individual is fixed to that layer unit's value.
+        """
+        self._ensure_layer_groups()
+
+        if target_modules and self.init_taget_module_cfg is None:
+            self.init_taget_module_cfg = deepcopy(target_modules)
+
+        seed_modules = target_modules if target_modules else self.init_taget_module_cfg
+
+        if mutant:
+            # Replace some to match the existing behavior
+            self.population = self.population[:-population_size]
+            per_group = max(1, population_size // len(self.layer_groups))
+            for layer_count in self.layer_groups:
+                for _ in range(per_group):
+                    if len(self.population) >= len(self.population) + population_size:
+                        break
+                    self.population.append(
+                        self._make_indiv_with_fixed_layer(self.init_taget_module_cfg, layer_count)
+                    )
+            return
+
+        self.population = []
+        per_group = population_size // len(self.layer_groups)
+        remainder = population_size - per_group * len(self.layer_groups)
+
+        for idx, layer_count in enumerate(self.layer_groups):
+            cnt = per_group + (1 if idx < remainder else 0)
+            for _ in range(cnt):
+                self.population.append(
+                    self._make_indiv_with_fixed_layer(seed_modules, layer_count)
+                )
+
+    def get_random_population(self, population_size):
+        """Also create the random individuals for migration (immigrant) evenly per layer unit."""
+        self._ensure_layer_groups()
+        population = []
+        per_group = max(1, population_size // len(self.layer_groups))
+
+        for layer_count in self.layer_groups:
+            for _ in range(per_group):
+                if len(population) >= population_size:
+                    break
+                population.append(
+                    self._make_indiv_with_fixed_layer(self.init_taget_module_cfg, layer_count)
+                )
+            if len(population) >= population_size:
+                break
+
+        while len(population) < population_size:
+            layer_count = random.choice(self.layer_groups)
+            population.append(
+                self._make_indiv_with_fixed_layer(self.init_taget_module_cfg, layer_count)
+            )
+        return population[:population_size]
+
+    # ------------------------------------------------------------------
+    # Crossover/mutation (only within a layer unit)
+    # ------------------------------------------------------------------
+    def make_new_gen(self, parents_, population_size):
+        """
+        - Classify the parents by layer_groups
+        - Pair up within the same layer_group for crossover/mutation
+        - n_layers is fixed to that layer_group's value
+        - Only d_model / intermediate_size use the existing mutate_hamming_k, mutate_bitflip
+        """
+        self._ensure_layer_groups()
+
+        # 1) Classify the parents into layer_group buckets
+        parents_by_layer = {lg: [] for lg in self.layer_groups}
+        for p in parents_:
+            nl = self._indiv_layer_count(p)
+            if nl is None:
+                assigned = random.choice(self.layer_groups)
+            else:
+                assigned = self._assign_layer_group(nl)
+            parents_by_layer[assigned].append(p)
+
+        # 2) Fill empty buckets with the whole parent pool (seed a random individual if there is still none)
+        for lg in self.layer_groups:
+            if not parents_by_layer[lg]:
+                if parents_:
+                    parents_by_layer[lg] = list(parents_)
+                else:
+                    parents_by_layer[lg] = [
+                        self._make_indiv_with_fixed_layer(self.init_taget_module_cfg, lg)
+                    ]
+
+        # 3) Compute the allocation count per group (even split, with the remainder distributed to the front)
+        per_group = population_size // len(self.layer_groups)
+        remainder = population_size - per_group * len(self.layer_groups)
+
+        population = []
+        for idx, layer_count in enumerate(self.layer_groups):
+            cnt = per_group + (1 if idx < remainder else 0)
+            group_parents = parents_by_layer[layer_count]
+
+            for _ in range(cnt):
+                p1 = random.choice(group_parents)
+                p2 = random.choice(group_parents)
+
+                indiv = {'n_layers': format(int(layer_count), 'b')}
+
+                # d_model, intermediate_size: crossover + mutation
+                for key in self.DROP_MODULE_LIST:
+                    g1 = p1.get(key)
+                    g2 = p2.get(key)
+
+                    # Handle the case where one of the parents is None (a dropped key)
+                    if g1 is None and g2 is None:
+                        gene = None
+                    elif g1 is None:
+                        gene = g2
+                    elif g2 is None:
+                        gene = g1
+                    else:
+                        gene = g1 if random.random() < 0.5 else g2
+
+                    if gene is not None:
+                        prob = random.random()
+                        if prob < 0.5:
+                            gene = self.mutate_hamming_k(gene)
+                        else:
+                            gene = self.mutate_bitflip(gene, 0.05)
+                    indiv[key] = gene
+
+                # In the end, one of d_model / intermediate_size must be None so that
+                # infer_missing_llama_config can correct it to match target_params.
+                if indiv.get('d_model') is not None and indiv.get('intermediate_size') is not None:
+                    none_key = random.choice(self.DROP_MODULE_LIST)
+                    indiv[none_key] = None
+
+                population.append(indiv)
+
+        return population[:population_size]
+
+    # ------------------------------------------------------------------
+    # evolution: use the parent class logic as is,
+    # but choose from DROP_MODULE_LIST so that the elite's none_key does not become n_layers.
+    # ------------------------------------------------------------------
+    def evolution(self, x, population_size):
+        iter_index = []
+        score_index = []
+        history = {"d_model": [], "intermediate_size": [], "n_layers": [], "n_heads": []}
+        best_indiv = None
+        best_score = -30000
+        iter_num = self.iter_num
+        patience = 0
+        before_best = 0
+        top_logits = None
+        elite_score_list = []
+
+        for i in range(1, iter_num):
+            self.score_cache = {}
+            self.invalidate_arch_cache()
+            score_list = []
+            new_population = []
+            for indiv in self.population:
+                sim, new_indiv, logits = self.apply_fn(indiv, x)
+                print(sim)
+                score_list.append(sim)
+                new_population.append(new_indiv)
+                flat_indiv = self.flat_chromo(new_indiv)
+                self.score_cache[flat_indiv] = sim
+                if sim > best_score:
+                    best_score = sim
+                    best_indiv = new_indiv
+                    top_logits = logits
+
+            # FSDP: synchronize the score to rank 0
+            if torch.distributed.is_initialized():
+                score_tensor = torch.tensor(score_list, dtype=torch.float64, device="cuda")
+                torch.distributed.broadcast(score_tensor, src=0)
+                score_list = score_tensor.tolist()
+                best_idx = score_list.index(max(score_list))
+                if max(score_list) > best_score:
+                    best_score = max(score_list)
+                    best_indiv = new_population[best_idx]
+
+            if best_score == before_best:
+                patience += 1
+            if patience >= 5:
+                print("GA early stopped")
+                break
+            before_best = best_score
+
+            temp_history = {"d_model": [], "intermediate_size": [], "n_layers": [], "n_heads": []}
+            for popul in new_population:
+                if popul == {}:
+                    continue
+                for key in temp_history.keys():
+                    v = popul.get(key)
+                    if v is None:
+                        continue
+                    temp_history[key].append(int(v, 2) if isinstance(v, str) else int(v))
+            for key in temp_history.keys():
+                if temp_history[key]:
+                    history[key].append(sum(temp_history[key]) / len(temp_history[key]))
+
+            print(f"best score {best_score}")
+
+            population = [
+                fun for _, fun in sorted(zip(score_list, new_population),
+                                         key=lambda pair: pair[0], reverse=True)
+            ]
+            score_list.sort(reverse=True)
+            k = max(2, int(self.elite_ratio * population_size))
+            parent_candidate = population[:k]
+            elite_score_list.append(sum(score_list[:k]) / k)
+            elite_cnt = max(2, int(self.elite_ratio * population_size))
+            elites = deepcopy(population[:elite_cnt])
+            for elite in elites:
+                if elite.get("total_params"):
+                    elite.pop("total_params")
+                # layer-wise: n_layers must be preserved, so choose only from DROP_MODULE_LIST
+                none_key = random.choice(self.DROP_MODULE_LIST)
+                elite[none_key] = None
+
+            offspring = self.make_new_gen(parent_candidate, population_size - elite_cnt)
+            immigrant_cnt = max(1, int(0.03 * population_size))
+            new_random = self.get_random_population(immigrant_cnt)
+            if immigrant_cnt > 0 and len(offspring) >= immigrant_cnt:
+                self.population = elites + offspring[:-immigrant_cnt] + new_random
+            else:
+                self.population = elites + offspring + new_random
+
+            iter_index.append(i)
+            score_index.append(best_score)
+
+        int_config_set = {
+            k: int(v, 2) if isinstance(v, str) else v for k, v in best_indiv.items()
+        }
+        self.finish_generation = i
+        print(
+            f"after {iter_num} iterations, score:{best_score}, "
+            f"the best individual is {int_config_set}"
+        )
+
+        output_dict = {
+            "best_indiv": best_indiv,
+            "logits": top_logits,
+        }
+        return output_dict
+
+
+if __name__=="__main__":
+    # population = intialize_population(100, 1)
+    # evolution(population, input_tensor, target, population_size=100)
+    pass
+

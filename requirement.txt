@@ -1,0 +1,41 @@
+# Based on princeton-nlp/LLM-Shearing (MIT License), Copyright (c) 2023 Princeton Natural Language Processing
+# Modified by dodowon, 2026. See THIRD_PARTY_NOTICES.md for details.
+
+# ---------------------------------------------------------------------------
+# Entries that keep the pins from the original LLM-Shearing (princeton-nlp) requirement.txt as-is
+# ---------------------------------------------------------------------------
+transformers==4.33.0
+composer==0.16.3
+llm-foundry==0.3.0
+fire
+
+# ---------------------------------------------------------------------------
+# Additional packages used by this repository's code
+# (based on an import scan. Versions are not pinned so as not to break compatibility with the original pins)
+# ---------------------------------------------------------------------------
+omegaconf
+numpy
+mosaicml-streaming      # import streaming — loads MDS datasets
+sentencepiece           # elasticpruner/data/llama_tokenizer.py
+datasets                # ga_eval_data/download_datasets.py, data/download_dataset.py
+filelock                # elasticpruner/datasets/partition.py
+torchmetrics            # elasticpruner/models/metrics.py
+tqdm
+einops
+
+# Log / sparsity visualization (elasticpruner/callbacks/air_callback.py)
+matplotlib
+seaborn
+
+# Benchmark result aggregation (calc_stat_bench.py, result_json_to_table.py)
+pandas
+scipy
+
+# ---------------------------------------------------------------------------
+# Requires separate installation (see install_pip.sh / not included in this file)
+# ---------------------------------------------------------------------------
+#   torch, torchvision, torchaudio : install the CUDA build via index-url
+#   flash-attn                     : must be built after torch is installed
+#   lm-eval                        : lm-evaluation-harness for icl_eval/ benchmarks
+#                                    https://github.com/EleutherAI/lm-evaluation-harness
+#   accelerate, apex, bitsandbytes : instruction_tuning/ (original code, optional)
